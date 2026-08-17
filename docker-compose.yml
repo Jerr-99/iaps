@@ -1,68 +1,326 @@
-version: '3.8'
+#The docker compose file for the IAPS project, defining services for PostgreSQL, Redis, Keycloak, Django API backend, 
+#Celery workers, Traefik reverse proxy, and React frontend.
+#Services are configured with environment variables, volumes for data persistence, health checks, and logging options. 
+#The file also defines a custom network for inter-service communication.
+#Volumes are created for PostgreSQL, Redis, static files, media files, and logs to ensure data persistence 
+#across container restarts. The Traefik service is set up to 
+#manage routing and SSL termination for the frontend and backend services.
+
+#Services:
+#  - postgres: PostgreSQL database service for storing application data.
+#  - redis: Redis service for caching and message brokering.
+#  - keycloak: Keycloak service for authentication and authorization. 
+#  - api: Django API backend service for handling application logic and API requests.
+#  - celery_worker: Celery worker service for processing asynchronous tasks.
+#  - traefik: Traefik service for reverse proxy and routing.
+#  - frontend: React frontend service for the user interface.
+version: '3.9'
 
 services:
+  # ============================================================================
+  # PostgreSQL Database: 
+  # ============================================================================
   postgres:
     image: postgres:14-alpine
-    container_name: iaps-db
+    container_name: iaps-postgres
     environment:
+      POSTGRES_DB: ${POSTGRES_DB:-iaps_db}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-iaps}
-    ports:
-      - "5432:5432"
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    networks:
-      - iaps-network
+      - ./backend/db/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - iaps_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
-  api-gateway:
-    build:
-      context: ./api-gateway
-      dockerfile: Dockerfile
-    container_name: iaps-api
+  # ============================================================================
+  # Redis Cache & Message Queue
+  # ============================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: iaps-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - iaps_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================================================
+  # Keycloak Authentication Service
+  # ============================================================================
+  keycloak:
+    image: keycloak/keycloak:latest
+    container_name: iaps-keycloak
+    environment:
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak_db
+      KC_DB_USERNAME: ${POSTGRES_USER:-postgres}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      KC_PROXY: edge
+      KC_HOSTNAME: ${KEYCLOAK_HOST:-localhost}
+    volumes:
+      - ./backend/config/keycloak:/opt/keycloak/data/import:ro
+    ports:
+      - "8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/auth/health/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - iaps_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================================================
+  # Django API Backend
+  # ============================================================================
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: iaps-api
+    command: sh -c "python manage.py migrate && python manage.py collectstatic --noinput && gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4"
     environment:
-      NODE_ENV: ${NODE_ENV:-development}
+      DEBUG: ${DEBUG:-False}
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-localhost,127.0.0.1,api}
+      POSTGRES_DB: ${POSTGRES_DB:-iaps_db}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-iaps}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      JWT_SECRET: ${JWT_SECRET:-change_this_secret}
-      ACCESS_EXPIRES_IN: ${ACCESS_EXPIRES_IN:-15m}
-      PORT: 4000
-    ports:
-      - "4000:4000"
-    networks:
-      - iaps-network
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      KEYCLOAK_SERVER_URL: ${KEYCLOAK_SERVER_URL:-http://keycloak:8080}
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-iaps}
+      KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-iaps-api}
+      KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-change-me}
+      CLAUDE_API_KEY: ${CLAUDE_API_KEY:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-3-5-sonnet-20241022}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://frontend}
     volumes:
-      - ./api-gateway/src:/app/src
-    command: npm run dev
+      - ./backend:/app
+      - static_volume:/app/staticfiles
+      - media_volume:/app/media
+      - logs_volume:/app/logs
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/schema/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - iaps_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
+  # ============================================================================
+  # Celery Worker for Async Tasks
+  # ============================================================================
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: iaps-celery-worker
+    command: celery -A config worker -l info --concurrency=4
+    environment:
+      DEBUG: ${DEBUG:-False}
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      POSTGRES_DB: ${POSTGRES_DB:-iaps_db}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      CLAUDE_API_KEY: ${CLAUDE_API_KEY:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-3-5-sonnet-20241022}
+    volumes:
+      - ./backend:/app
+      - logs_volume:/app/logs
+    depends_on:
+      - postgres
+      - redis
+      - api
+    networks:
+      - iaps_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================================================
+  # Celery Beat for Scheduled Tasks (Optional)
+  # ============================================================================
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: iaps-celery-beat
+    command: celery -A config beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    environment:
+      DEBUG: ${DEBUG:-False}
+      SECRET_KEY: ${SECRET_KEY:-change-me-in-production}
+      POSTGRES_DB: ${POSTGRES_DB:-iaps_db}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+      - logs_volume:/app/logs
+    depends_on:
+      - postgres
+      - redis
+      - api
+    networks:
+      - iaps_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================================================
+  # Traefik API Gateway & Reverse Proxy
+  # ============================================================================
+  traefik:
+    image: traefik:v2.11
+    container_name: iaps-traefik
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--log.level=INFO"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik.yml:/traefik.yml:ro
+      - ./config/traefik/acme.json:/acme.json
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8081:8080"  # Traefik Dashboard
+    depends_on:
+      - api
+      - keycloak
+      - frontend
+    networks:
+      - iaps_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ============================================================================
+  # React Frontend Application
+  # ============================================================================
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: iaps-web
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    container_name: iaps-frontend
     environment:
-      VITE_API_URL: ${VITE_API_URL:-http://localhost:4000}
-    ports:
-      - "5173:5173"
-    networks:
-      - iaps-network
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+      NODE_ENV: ${NODE_ENV:-production}
     volumes:
-      - ./frontend/src:/app/src
+      - ./frontend/src:/app/src:ro
+      - ./frontend/public:/app/public:ro
+    ports:
+      - "80:80"
+      - "5173:5173"  # Dev server
+    depends_on:
+      - api
+    networks:
+      - iaps_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
+# ============================================================================
+# Volumes for Data Persistence
+# ============================================================================
 volumes:
   postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  static_volume:
+    driver: local
+  media_volume:
+    driver: local
+  logs_volume:
+    driver: local
 
+# ============================================================================
+# Networks
+# ============================================================================
 networks:
-  iaps-network:
+  iaps_network:
     driver: bridge
